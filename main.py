@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlencode
 
 import requests
 from dotenv import load_dotenv
@@ -161,7 +161,9 @@ def parse_raw_offer(offer: dict[str, Any], origin: str, destination: str, depart
         owner_name = offer.get("owner", {}).get("name", "Unknown Airline")
         total_amount = Decimal(str(offer.get("total_amount")))
         total_currency = str(offer.get("total_currency", "USD")).upper()
-        booking_link = str(offer.get("booking_requirements", {}).get("conditions", "https://www.google.com/travel/flights"))
+        booking_link = str(offer.get("booking_url") or "").strip()
+        if not booking_link.startswith(("http://", "https://")):
+            booking_link = "https://www.google.com/travel/flights"
 
         return RawOffer(
             route=f"{origin}-{destination}",
@@ -316,6 +318,16 @@ def build_quickchart_url(old_price: Decimal, new_price: Decimal, currency: str) 
     return f"https://quickchart.io/chart?c={encoded_config}"
 
 
+def build_alert_booking_link(origin: str, destination: str, departure_date: date, booking_link: str) -> str:
+    if booking_link.startswith(("http://", "https://")) and booking_link != "https://www.google.com/travel/flights":
+        return booking_link
+
+    query_params = {
+        "q": f"Flights from {origin} to {destination} on {departure_date.isoformat()}",
+    }
+    return f"https://www.google.com/travel/flights?{urlencode(query_params)}"
+
+
 def render_drop_alert_html(
     route_from: str,
     route_to: str,
@@ -355,6 +367,7 @@ def render_drop_alert_html(
 def send_email_alert(
     route_from: str,
     route_to: str,
+    departure_date: date,
     old_price: Decimal,
     new_price: Decimal,
     currency: str,
@@ -373,6 +386,12 @@ def send_email_alert(
         return
 
     chart_url = build_quickchart_url(old_price=old_price, new_price=new_price, currency=currency)
+    alert_booking_link = build_alert_booking_link(
+        origin=route_from,
+        destination=route_to,
+        departure_date=departure_date,
+        booking_link=booking_link,
+    )
     html_body = render_drop_alert_html(
         route_from=route_from,
         route_to=route_to,
@@ -381,7 +400,7 @@ def send_email_alert(
         currency=currency,
         drop_pct=drop_pct,
         chart_url=chart_url,
-        booking_link=booking_link,
+        booking_link=alert_booking_link,
     )
     subject = f"📉 Price Drop Alert: {route_from} to {route_to}!"
 
@@ -434,6 +453,7 @@ def run_pipeline() -> None:
             send_email_alert(
                 route_from=record.origin,
                 route_to=record.destination,
+                departure_date=record.departure_date,
                 old_price=previous_price,
                 new_price=record.simulated_price,
                 currency=record.currency,
