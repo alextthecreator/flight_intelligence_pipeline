@@ -290,21 +290,26 @@ def load_record(supabase: Client, record: FlightPriceRecord) -> bool:
 
 
 def build_quickchart_url(old_price: Decimal, new_price: Decimal, currency: str) -> str:
+    y_axis_max = float(old_price + Decimal("50.00"))
     chart_config = {
-        "type": "bar",
+        "type": "line",
         "data": {
             "labels": ["Previous", "Current"],
             "datasets": [
                 {
                     "label": f"Price ({currency})",
                     "data": [float(old_price), float(new_price)],
-                    "backgroundColor": ["#9ca3af", "#ef4444"],
+                    "borderColor": "#ef4444",
+                    "backgroundColor": "rgba(239,68,68,0.15)",
+                    "fill": True,
+                    "tension": 0.35,
+                    "pointRadius": 4,
                 }
             ],
         },
         "options": {
             "plugins": {"legend": {"display": False}},
-            "scales": {"y": {"beginAtZero": False}},
+            "scales": {"y": {"min": 0, "max": y_axis_max}},
         },
     }
     encoded_config = quote_plus(json.dumps(chart_config, separators=(",", ":")))
