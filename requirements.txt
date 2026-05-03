@@ -1,0 +1,6 @@
+duffel-api
+pydantic
+supabase
+python-dotenv
+requests
+resend
