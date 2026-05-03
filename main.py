@@ -6,7 +6,7 @@ import os
 import random
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
 from typing import Any
 from urllib.parse import quote_plus, urlencode
 
@@ -348,7 +348,9 @@ def build_quickchart_url(
     labels: list[str] | None = None,
     values: list[float] | None = None,
 ) -> str:
-    y_axis_max = float(old_price + Decimal("50.00"))
+    y_axis_max = float(
+        (old_price / Decimal("50")).to_integral_value(rounding=ROUND_CEILING) * Decimal("50")
+    )
     chart_labels = labels if labels else ["Previous", "Current"]
     chart_values = values if values else [float(old_price), float(new_price)]
     chart_config = {
@@ -371,8 +373,12 @@ def build_quickchart_url(
         "options": {
             "plugins": {"legend": {"display": False}},
             "scales": {
+                # Force showing all day labels on the x-axis.
+                "x": {"ticks": {"autoSkip": False, "maxRotation": 0, "minRotation": 0}},
                 # `y` is used by Chart.js v3/v4.
                 "y": {"min": 0, "max": y_axis_max, "beginAtZero": True},
+                # `xAxes`/`yAxes` keep compatibility for engines interpreting v2 syntax.
+                "xAxes": [{"ticks": {"autoSkip": False, "maxRotation": 0, "minRotation": 0}}],
                 # `yAxes` keeps compatibility with environments still interpreting v2 syntax.
                 "yAxes": [{"ticks": {"min": 0, "max": y_axis_max, "beginAtZero": True}}],
             },
