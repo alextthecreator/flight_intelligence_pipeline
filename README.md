@@ -38,6 +38,7 @@ The pipeline now includes an email notification layer:
 3. Sends a professional HTML email with route, old/new price, percentage drop, and booking link.
 4. Embeds a QuickChart image generated dynamically from previous vs current price.
 5. Reads `RESEND_API_KEY` from environment variables (`.env` locally and GitHub Secrets in CI).
+System notifications run in Sandbox mode (Resend API) and send alerts to the administrator's verified email address.
 
 ## 🛠️ Installation & Setup
 1. Clone the repository.
