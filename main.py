@@ -89,6 +89,22 @@ def create_supabase_client() -> Client:
     return create_client(supabase_url, supabase_key)
 
 
+def get_alert_drop_threshold_pct() -> Decimal:
+    configured = os.getenv("ALERT_DROP_THRESHOLD_PCT", "").strip()
+    if not configured:
+        return ALERT_DROP_THRESHOLD_PCT
+
+    try:
+        return Decimal(configured)
+    except (InvalidOperation, ValueError):
+        logging.warning(
+            "Invalid ALERT_DROP_THRESHOLD_PCT value '%s'. Falling back to %s.",
+            configured,
+            ALERT_DROP_THRESHOLD_PCT,
+        )
+        return ALERT_DROP_THRESHOLD_PCT
+
+
 def duffel_headers(duffel_token: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {duffel_token}",
@@ -331,13 +347,18 @@ def build_alert_trend_series(
         daily_prices[day_key] = price
 
     sorted_days = sorted(daily_prices.items())
-    history_points = sorted_days[-(ALERT_TREND_HISTORY_DAYS - 1) :]
+    history_points = sorted_days[-ALERT_TREND_HISTORY_DAYS :]
 
     labels = [day[0][5:] for day in history_points]
     values = [float(day[1]) for day in history_points]
 
-    labels.append("Today")
-    values.append(float(current_price))
+    today_label = date.today().isoformat()[5:]
+    if labels and labels[-1] == today_label:
+        labels[-1] = "Today"
+        values[-1] = float(current_price)
+    else:
+        labels.append("Today")
+        values.append(float(current_price))
     return labels, values
 
 
@@ -348,11 +369,13 @@ def build_quickchart_url(
     labels: list[str] | None = None,
     values: list[float] | None = None,
 ) -> str:
-    y_axis_max = float(
-        (old_price / Decimal("50")).to_integral_value(rounding=ROUND_CEILING) * Decimal("50")
-    )
     chart_labels = labels if labels else ["Previous", "Current"]
     chart_values = values if values else [float(old_price), float(new_price)]
+    highest_visible_price = max(chart_values) if chart_values else float(old_price)
+    y_axis_target = Decimal(str(highest_visible_price)) + Decimal("50")
+    y_axis_max = float(
+        (y_axis_target / Decimal("50")).to_integral_value(rounding=ROUND_CEILING) * Decimal("50")
+    )
     chart_config = {
         "version": "4",
         "type": "line",
@@ -445,17 +468,17 @@ def send_email_alert(
     booking_link: str,
     trend_labels: list[str] | None = None,
     trend_values: list[float] | None = None,
-) -> None:
+) -> bool:
     api_key = os.getenv("RESEND_API_KEY", "").strip()
     sender_email = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev").strip()
     recipient_email = os.getenv("ALERT_EMAIL_TO", "").strip()
 
     if not api_key:
         logging.warning("RESEND_API_KEY is missing. Skipping alert email.")
-        return
+        return False
     if not recipient_email:
         logging.warning("ALERT_EMAIL_TO is missing. Skipping alert email.")
-        return
+        return False
 
     chart_url = build_quickchart_url(
         old_price=old_price,
@@ -495,8 +518,10 @@ def send_email_alert(
             }
         )
         logging.info("Email alert sent for route %s-%s", route_from, route_to)
+        return True
     except Exception as exc:  # noqa: BLE001 - keep pipeline running on alert failures
         logging.error("Failed to send email alert for route %s-%s: %s", route_from, route_to, exc)
+        return False
 
 
 def run_pipeline() -> None:
@@ -514,6 +539,10 @@ def run_pipeline() -> None:
         return
 
     inserted = 0
+    alerts_sent = 0
+    alert_drop_threshold = get_alert_drop_threshold_pct()
+    logging.info("Alert drop threshold is set to %s%%", alert_drop_threshold)
+
     for raw_offer in offers:
         previous = fetch_last_route_record(supabase, raw_offer.route)
         record = transform_offer(raw_offer, previous)
@@ -522,18 +551,31 @@ def run_pipeline() -> None:
 
         previous_price_raw = previous.get("simulated_price") if previous else None
         previous_price = Decimal(str(previous_price_raw)) if previous_price_raw is not None else None
+        abs_drop_pct = abs(record.price_change_pct)
         significant_drop = (
             previous_price is not None
             and record.trend == "DOWN"
-            and abs(record.price_change_pct) > ALERT_DROP_THRESHOLD_PCT
+            and abs_drop_pct > alert_drop_threshold
         )
+
+        logging.info(
+            "Alert evaluation for %s | previous=%s current=%s trend=%s drop_pct=%s threshold=%s trigger=%s",
+            record.route,
+            previous_price if previous_price is not None else "n/a",
+            record.simulated_price,
+            record.trend,
+            abs_drop_pct,
+            alert_drop_threshold,
+            significant_drop,
+        )
+
         if significant_drop:
             recent_history = fetch_recent_route_records(supabase=supabase, route=record.route)
             trend_labels, trend_values = build_alert_trend_series(
                 history_records=recent_history,
                 current_price=record.simulated_price,
             )
-            send_email_alert(
+            email_sent = send_email_alert(
                 route_from=record.origin,
                 route_to=record.destination,
                 departure_date=record.departure_date,
@@ -545,11 +587,13 @@ def run_pipeline() -> None:
                 trend_labels=trend_labels,
                 trend_values=trend_values,
             )
+            if email_sent:
+                alerts_sent += 1
 
         if load_record(supabase, record):
             inserted += 1
 
-    logging.info("Pipeline completed. Inserted rows: %s", inserted)
+    logging.info("Pipeline completed. Inserted rows: %s, alerts sent: %s", inserted, alerts_sent)
 
 
 if __name__ == "__main__":
