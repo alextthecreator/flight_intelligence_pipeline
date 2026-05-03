@@ -5,7 +5,7 @@ import json
 import os
 import random
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 from urllib.parse import quote_plus, urlencode
@@ -22,6 +22,7 @@ SIMULATION_MIN_DELTA = Decimal("-50.00")
 SIMULATION_MAX_DELTA = Decimal("50.00")
 STABLE_THRESHOLD_PCT = Decimal("0.50")
 ALERT_DROP_THRESHOLD_PCT = Decimal("3.00")
+ALERT_TREND_HISTORY_DAYS = 7
 DEFAULT_TIMEOUT_SECONDS = 30
 
 ROUTES: list[tuple[str, str]] = [
@@ -231,6 +232,25 @@ def fetch_last_route_record(supabase: Client, route: str) -> dict[str, Any] | No
         return None
 
 
+def fetch_recent_route_records(
+    supabase: Client, route: str, days: int = ALERT_TREND_HISTORY_DAYS
+) -> list[dict[str, Any]]:
+    start_date = (date.today() - timedelta(days=days - 1)).isoformat()
+    try:
+        response = (
+            supabase.table("flight_prices")
+            .select("created_at, simulated_price")
+            .eq("route", route)
+            .gte("created_at", start_date)
+            .order("created_at", desc=False)
+            .execute()
+        )
+        return response.data or []
+    except Exception as exc:  # noqa: BLE001 - preserving DB errors in logs
+        logging.error("Supabase recent history query failed for route %s: %s", route, exc)
+        return []
+
+
 def compute_price_change_and_trend(previous_price: Decimal | None, current_price: Decimal) -> tuple[Decimal, str]:
     if previous_price is None or previous_price <= Decimal("0"):
         return Decimal("0.00"), "STABLE"
@@ -291,16 +311,55 @@ def load_record(supabase: Client, record: FlightPriceRecord) -> bool:
         return False
 
 
-def build_quickchart_url(old_price: Decimal, new_price: Decimal, currency: str) -> str:
+def build_alert_trend_series(
+    history_records: list[dict[str, Any]], current_price: Decimal
+) -> tuple[list[str], list[float]]:
+    daily_prices: dict[str, Decimal] = {}
+    for item in history_records:
+        created_at_raw = item.get("created_at")
+        price_raw = item.get("simulated_price")
+        if created_at_raw is None or price_raw is None:
+            continue
+
+        try:
+            created_at = datetime.fromisoformat(str(created_at_raw).replace("Z", "+00:00"))
+            price = Decimal(str(price_raw))
+        except (ValueError, TypeError, InvalidOperation):
+            continue
+
+        day_key = created_at.date().isoformat()
+        daily_prices[day_key] = price
+
+    sorted_days = sorted(daily_prices.items())
+    history_points = sorted_days[-(ALERT_TREND_HISTORY_DAYS - 1) :]
+
+    labels = [day[0][5:] for day in history_points]
+    values = [float(day[1]) for day in history_points]
+
+    labels.append("Today")
+    values.append(float(current_price))
+    return labels, values
+
+
+def build_quickchart_url(
+    old_price: Decimal,
+    new_price: Decimal,
+    currency: str,
+    labels: list[str] | None = None,
+    values: list[float] | None = None,
+) -> str:
     y_axis_max = float(old_price + Decimal("50.00"))
+    chart_labels = labels if labels else ["Previous", "Current"]
+    chart_values = values if values else [float(old_price), float(new_price)]
     chart_config = {
+        "version": "4",
         "type": "line",
         "data": {
-            "labels": ["Previous", "Current"],
+            "labels": chart_labels,
             "datasets": [
                 {
                     "label": f"Price ({currency})",
-                    "data": [float(old_price), float(new_price)],
+                    "data": chart_values,
                     "borderColor": "#ef4444",
                     "backgroundColor": "rgba(239,68,68,0.15)",
                     "fill": True,
@@ -311,7 +370,12 @@ def build_quickchart_url(old_price: Decimal, new_price: Decimal, currency: str) 
         },
         "options": {
             "plugins": {"legend": {"display": False}},
-            "scales": {"y": {"min": 0, "max": y_axis_max}},
+            "scales": {
+                # `y` is used by Chart.js v3/v4.
+                "y": {"min": 0, "max": y_axis_max, "beginAtZero": True},
+                # `yAxes` keeps compatibility with environments still interpreting v2 syntax.
+                "yAxes": [{"ticks": {"min": 0, "max": y_axis_max, "beginAtZero": True}}],
+            },
         },
     }
     encoded_config = quote_plus(json.dumps(chart_config, separators=(",", ":")))
@@ -373,6 +437,8 @@ def send_email_alert(
     currency: str,
     drop_pct: Decimal,
     booking_link: str,
+    trend_labels: list[str] | None = None,
+    trend_values: list[float] | None = None,
 ) -> None:
     api_key = os.getenv("RESEND_API_KEY", "").strip()
     sender_email = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev").strip()
@@ -385,7 +451,13 @@ def send_email_alert(
         logging.warning("ALERT_EMAIL_TO is missing. Skipping alert email.")
         return
 
-    chart_url = build_quickchart_url(old_price=old_price, new_price=new_price, currency=currency)
+    chart_url = build_quickchart_url(
+        old_price=old_price,
+        new_price=new_price,
+        currency=currency,
+        labels=trend_labels,
+        values=trend_values,
+    )
     alert_booking_link = build_alert_booking_link(
         origin=route_from,
         destination=route_to,
@@ -450,6 +522,11 @@ def run_pipeline() -> None:
             and abs(record.price_change_pct) > ALERT_DROP_THRESHOLD_PCT
         )
         if significant_drop:
+            recent_history = fetch_recent_route_records(supabase=supabase, route=record.route)
+            trend_labels, trend_values = build_alert_trend_series(
+                history_records=recent_history,
+                current_price=record.simulated_price,
+            )
             send_email_alert(
                 route_from=record.origin,
                 route_to=record.destination,
@@ -459,6 +536,8 @@ def run_pipeline() -> None:
                 currency=record.currency,
                 drop_pct=abs(record.price_change_pct),
                 booking_link=record.booking_link,
+                trend_labels=trend_labels,
+                trend_values=trend_values,
             )
 
         if load_record(supabase, record):
